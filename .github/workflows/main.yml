@@ -49,10 +49,10 @@ jobs:
           distribution: zulu
           java-version: '17'
 
-      - name: Install SDK packages
-        run: |
-          yes | sdkmanager --licenses
-          sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+      # - name: Install SDK packages
+      #   run: |
+      #     yes | sdkmanager --licenses
+      #     sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
       - name: Install native build dependencies
         run: |
@@ -61,13 +61,16 @@ jobs:
 
       - name: Install Android SDK components
         run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager \
-            "platform-tools" \
-            "platforms;android-30" \
-            "build-tools;30.0.3" \
-            "ndk;21.4.7075529" \
-            "cmake;3.22.1"
+          export ANDROID_HOME=/usr/local/lib/android/sdk
+          export ANDROID_SDK_ROOT=$ANDROID_HOME
+          SDKM=$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager
+          [ -x "$SDKM" ] || SDKM=$(ls -d $ANDROID_HOME/cmdline-tools/*/bin/sdkmanager | head -n1)
+          yes | $SDKM --licenses >/dev/null || true
+          $SDKM "platform-tools" "platforms;android-34" "build-tools;34.0.0" \
+            "platforms;android-30" "build-tools;30.0.3" \
+            "ndk;21.4.7075529" "cmake;3.22.1"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> $GITHUB_ENV
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> $GITHUB_ENV
 
       # ------------------------------------------------------------------
       # Patches the freshly-checked-out Telegram sources into DropGram:
