@@ -1,0 +1,333 @@
+name: Build DropGram APK
+
+on:
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+
+# ---------------------------------------------------------------------------
+# Everything that makes this build "yours" lives in this env block.
+# Change values here - do not edit the steps below.
+# ---------------------------------------------------------------------------
+env:
+  APP_PACKAGE: "org.dropgram.web"              # applicationId / package name
+  APP_NAME: "DropGram"                         # app name shown in the launcher
+  SERVER_IPV4: "177.3.208.223"                 # your Telegram server IP
+  SERVER_IPV6: "fe80::91c9:ad67:3da3:4743%20"  # declared but IPv6 connections stay disabled
+  SERVER_PORT: "2398"                          # your Telegram server port
+  # Fingerprint your server sends in resPQ (must match server-side config, it is
+  # NOT derivable from the key). If the app logs "can't find valid server public
+  # key" on connect, set this to the value your server actually sends.
+  RSA_FINGERPRINT: "0x7c28094efda11350"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 250
+
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+          sudo swapoff -a || true
+          sudo rm -f /mnt/swapfile
+          sudo apt-get clean
+          df -h
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: zulu
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcurl4-openssl-dev nlohmann-json3-dev
+
+      - name: Install Android SDK components
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-30" \
+            "build-tools;30.0.3" \
+            "ndk;21.4.7075529" \
+            "cmake;3.22.1"
+
+      # ------------------------------------------------------------------
+      # Patches the freshly-checked-out Telegram sources into DropGram:
+      #   1. gradle.properties          APP_PACKAGE
+      #   2. */build.gradle             applicationId
+      #   3. strings.xml                AppName
+      #   4. */google-services.json     package names (all modules)
+      #   5. */build.gradle             google-services plugin commented out
+      #   6. jni/tgnet                  leftover Telegram IPs swept
+      #   7. Handshake.cpp              YOUR RSA key + fingerprint (both branches)
+      #   8. ConnectionsManager.cpp     initDatacenters() -> IP:2398, IPv6 off
+      # ------------------------------------------------------------------
+      - name: Patch Configuration Files
+        run: |
+          set -e
+
+          echo "--- [1/8] gradle.properties: APP_PACKAGE ---"
+          if grep -q "^APP_PACKAGE[[:space:]]*=" gradle.properties; then
+              sed -i "s/^APP_PACKAGE[[:space:]]*=.*/APP_PACKAGE=${APP_PACKAGE}/" gradle.properties
+              grep -n "^APP_PACKAGE" gradle.properties
+          else
+              echo "WARNING: no APP_PACKAGE entry found in gradle.properties (skipped)"
+          fi
+
+          echo "--- [2/8] build.gradle: applicationId ---"
+          find . -name "build.gradle" -not -path "*/build/*" \
+              -exec sed -i "s/applicationId .*/applicationId \"${APP_PACKAGE}\"/g" {} +
+
+          echo "--- [3/8] strings.xml: AppName ---"
+          find TMessagesProj/src/main/res/ -name "strings.xml" \
+              -exec sed -i "s#<string name=\"AppName\">.*</string>#<string name=\"AppName\">${APP_NAME}</string>#g" {} +
+
+          echo "--- [4/8] google-services.json: package_name ---"
+          find . -name "google-services.json" -not -path "*/build/*" \
+              -exec sed -i "s/org\.telegram\.messenger/${APP_PACKAGE}/g" {} +
+
+          echo "--- [5/8] build.gradle: disable google-services plugin ---"
+          find . -name "build.gradle" -not -path "*/build/*" \
+              -exec sed -i "s|^\([[:space:]]*\)apply plugin: 'com.google.gms.google-services'|\1// apply plugin: 'com.google.gms.google-services'|" {} +
+          find . -name "build.gradle" -not -path "*/build/*" \
+              -exec sed -i "s|^\([[:space:]]*\)id 'com.google.gms.google-services'|\1// id 'com.google.gms.google-services'|" {} +
+
+          echo "--- [6/8] jni/tgnet: sweep leftover Telegram server IPs ---"
+          find TMessagesProj/jni/tgnet -type f \( -name '*.cpp' -o -name '*.h' \) -exec sed -i \
+              -e "s/149\.154\.[0-9]\+\.[0-9]\+/${SERVER_IPV4}/g" \
+              -e "s/91\.108\.[0-9]\+\.[0-9]\+/${SERVER_IPV4}/g" \
+              -e "s/95\.161\.76\.100/${SERVER_IPV4}/g" \
+              -e "s/YOUR_SERVER_IP/${SERVER_IPV4}/g" {} +
+
+          echo "--- [7/8] Handshake.cpp: RSA key + fingerprint ---"
+          echo "--- [8/8] ConnectionsManager.cpp: initDatacenters() ---"
+          python3 - <<'PYEOF'
+          #!/usr/bin/env python3
+          """
+          DropGram build-time patcher (runs inside the GitHub Actions patch step).
+
+          Patches the Telegram-Android native sources so the app talks to your own
+          server instead of Telegram's:
+
+            * TMessagesProj/jni/tgnet/Handshake.cpp
+                  every serverPublicKeys.emplace_back(...)  -> your RSA public key
+                  every serverPublicKeysFingerprints entry  -> your fingerprint
+                  (both the "empty" branch and the "else" branch, exactly like the
+                   hand-edited file you showed me)
+
+            * TMessagesProj/jni/tgnet/ConnectionsManager.cpp
+                  initDatacenters() gets ipv4/ipv6/port/port2 variables,
+                  DC1 -> addAddressAndPort(ipv4="<your ip>", port=<your port>, 0, "")
+                  all other DCs -> addAddressAndPort(ipv4, port, 0, "")
+                  every IPv6 addAddressAndPort(...) -> commented out
+
+          All patches are idempotent: running them on an already-patched tree
+          converges to the same result, so the workflow can be re-run safely.
+          """
+          import os
+          import re
+          import sys
+
+          SERVER_IPV4 = os.environ.get("SERVER_IPV4", "177.3.208.223")
+          SERVER_IPV6 = os.environ.get("SERVER_IPV6", "fe80::91c9:ad67:3da3:4743%20")
+          SERVER_PORT = os.environ.get("SERVER_PORT", "2398")
+          RSA_FINGERPRINT = os.environ.get("RSA_FINGERPRINT", "0x7c28094efda11350")
+
+          # Your server RSA public key (PKCS#1, without the PEM header/footer lines).
+          # If your key ever changes, edit these lines.
+          RSA_KEY_BODY = [
+              "MIIBCgKCAQEAwRBimRGOEEa2sy1/gWi6NghKeiDdORt18eoDHiKD1HvJqqkzSiOG",
+              "+FvbI+fRFy7FbOhoUlZyYVXuJMCuAlse20sW9j6SMPudjJwghFosXBK9aB4FVtII",
+              "ZfljcKhlE8aqyC79BX68vDwziKJvMaJKCawurGSmEvjjc0R6wlqNGZmFbo1+B1zV",
+              "mHR6Ji+PX1ArCDUl870Q8Uk4RtAl+xO4qm6Jv/9694RbJw/Kb3/R0nc4vYN4+oUq",
+              "ikgXFyDw7ZLg10fbV6pwV8Grw2P8DI4rLE2lMQ6J0CXAl/3GdI0izHf6RMVc18LX",
+              "RWrn7yD2r+2O3x8LqpBYcpQ3L76s6qDsdQIDAQAB",
+          ]
+
+          HS_PATH = "TMessagesProj/jni/tgnet/Handshake.cpp"
+          CM_PATH = "TMessagesProj/jni/tgnet/ConnectionsManager.cpp"
+
+
+          def fail(msg):
+              sys.stderr.write("\n!!! PATCH ERROR: %s\n" % msg)
+              sys.exit(1)
+
+
+          # ===========================================================================
+          # 1) Handshake.cpp : your RSA public key + fingerprint in BOTH branches
+          # ===========================================================================
+          def key_block(indent):
+              lines = [indent + 'serverPublicKeys.emplace_back("-----BEGIN RSA PUBLIC KEY-----\\n"']
+              for b64 in RSA_KEY_BODY:
+                  lines.append(indent + '        "' + b64 + '\\n"')
+              lines.append(indent + '        "-----END RSA PUBLIC KEY-----");')
+              return "\n".join(lines)
+
+
+          STRICT_EMPLACE = re.compile(
+              r'([ \t]*)serverPublicKeys\.emplace_back\("-----BEGIN RSA PUBLIC KEY-----\\n"\n'
+              r'(?:[ \t]*"[^"\n]*"\n)*'
+              r'[ \t]*"-----END RSA PUBLIC KEY-----"\);'
+          )
+          LOOSE_EMPLACE = re.compile(r'([ \t]*)serverPublicKeys\.emplace_back\(.*?\);', re.DOTALL)
+          FP_PUSH = re.compile(r'serverPublicKeysFingerprints\.push_back\(0x[0-9a-fA-F]+(?:ULL|UL|LL|L|U)?\);')
+
+          with open(HS_PATH, "r", encoding="utf-8") as f:
+              src = f.read()
+
+          src, n_keys = STRICT_EMPLACE.subn(lambda m: key_block(m.group(1)), src)
+          if n_keys == 0 and RSA_KEY_BODY[0] not in src:
+              src, n_keys = LOOSE_EMPLACE.subn(lambda m: key_block(m.group(1)), src)
+              if n_keys:
+                  print("Handshake.cpp: strict key matcher found nothing, used loose matcher")
+          src, n_fps = FP_PUSH.subn(
+              "serverPublicKeysFingerprints.push_back(%s);" % RSA_FINGERPRINT, src)
+
+          # Telegram keeps several keys per branch; after replacing them all with our
+          # single key, collapse the duplicated entries that would otherwise remain.
+          E = (r'serverPublicKeys\.emplace_back\("-----BEGIN RSA PUBLIC KEY-----\\n"\n'
+               r'(?:[ \t]*"[^"\n]*"\n)*'
+               r'[ \t]*"-----END RSA PUBLIC KEY-----"\);')
+          F = r'serverPublicKeysFingerprints\.push_back\(' + re.escape(RSA_FINGERPRINT) + r'\);'
+          src = re.sub(r'(' + E + r'\n)([ \t]*' + E + r'\n)+', r'\1', src)                 # key,key
+          src = re.sub(r'(' + F + r'\n)([ \t]*' + F + r'\n)+', r'\1', src)                 # fp,fp
+          src = re.sub(r'(' + E + r'\n[ \t]*' + F + r'\n)(?:[ \t]*' + E + r'\n[ \t]*' + F + r'\n)+',
+                       r'\1', src)                                                          # pair,pair
+
+          if RSA_KEY_BODY[0] not in src:
+              fail("your RSA public key was not injected into %s - check the file structure" % HS_PATH)
+          if RSA_FINGERPRINT not in src:
+              fail("fingerprint %s was not injected into %s" % (RSA_FINGERPRINT, HS_PATH))
+
+          with open(HS_PATH, "w", encoding="utf-8", newline="\n") as f:
+              f.write(src)
+          print("Handshake.cpp         : %d key block(s) -> your key, %d fingerprint(s) -> %s"
+                % (n_keys, n_fps, RSA_FINGERPRINT))
+
+          # ===========================================================================
+          # 2) ConnectionsManager.cpp : initDatacenters() -> your server
+          # ===========================================================================
+          with open(CM_PATH, "r", encoding="utf-8") as f:
+              src = f.read()
+
+          FUNC = re.compile(r'void ConnectionsManager::initDatacenters\(\) \{.*?\n\}', re.DOTALL)
+          m = FUNC.search(src)
+          if m is None:
+              fail("initDatacenters() not found in %s" % CM_PATH)
+          func = m.group(0)
+          new_func = func
+
+          # a) declare the custom address variables at the top of the function
+          if "std::string ipv4" not in new_func:
+              decl = ('    std::string ipv4="%s";\n'
+                      '    std::string ipv6="%s";\n'
+                      '    uint32_t port=%s;\n'
+                      '    uint32_t port2=%s;\n') % (SERVER_IPV4, SERVER_IPV6, SERVER_PORT, SERVER_PORT)
+              new_func, n = re.subn(r'([ \t]*)Datacenter \*datacenter;\n',
+                                    lambda mm: mm.group(0) + decl, new_func, count=1)
+              if n == 0:
+                  fail("'Datacenter *datacenter;' not found inside initDatacenters()")
+
+          # b) keep already-declared variables in sync with the env values
+          new_func = re.sub(r'std::string ipv4="[^"]*";', 'std::string ipv4="%s";' % SERVER_IPV4, new_func)
+          new_func = re.sub(r'std::string ipv6="[^"]*";', 'std::string ipv6="%s";' % SERVER_IPV6, new_func)
+          new_func = re.sub(r'uint32_t port=\d+;', 'uint32_t port=%s;' % SERVER_PORT, new_func)
+          new_func = re.sub(r'uint32_t port2=\d+;', 'uint32_t port2=%s;' % SERVER_PORT, new_func)
+
+          # c) every IPv4 addAddressAndPort() -> your server (DC1 gets explicit values)
+          state = {"n": 0}
+
+
+          def ipv4_repl(_m):
+              state["n"] += 1
+              if state["n"] == 1:
+                  return 'datacenter->addAddressAndPort(ipv4="%s", port=%s, 0, "");' % (SERVER_IPV4, SERVER_PORT)
+              return 'datacenter->addAddressAndPort(ipv4, port, 0, "");'
+
+
+          new_func = re.sub(
+              r'datacenter->addAddressAndPort\("(?:\d{1,3}\.){3}\d{1,3}",\s*\d+,\s*0,\s*"[^"]*"\);',
+              ipv4_repl, new_func)
+
+          # d) every IPv6 addAddressAndPort() -> commented out
+          new_func = re.sub(
+              r'^([ \t]*)datacenter->addAddressAndPort\("[0-9A-Fa-f:]+",\s*\d+,\s*1,\s*"[^"]*"\);[ \t]*$',
+              lambda mm: mm.group(1) + '//datacenter->addAddressAndPort(ipv6, port, 1, "");',
+              new_func, flags=re.MULTILINE)
+
+          # e) DC2 originally lists two IPv4 addresses - collapse the duplicate line
+          new_func = re.sub(
+              r'(datacenter->addAddressAndPort\(ipv4, port, 0, ""\);\n)([ \t]*datacenter->addAddressAndPort\(ipv4, port, 0, ""\);\n)+',
+              r'\1', new_func)
+
+          # f) if DC1 was already patched with different values, normalise them
+          new_func = re.sub(
+              r'datacenter->addAddressAndPort\(ipv4="[^"]*", port=\d+, 0, ""\);',
+              'datacenter->addAddressAndPort(ipv4="%s", port=%s, 0, "");' % (SERVER_IPV4, SERVER_PORT),
+              new_func)
+
+          src = src.replace(func, new_func)
+
+          # verification: nothing unconverted may remain
+          active = [l.strip() for l in new_func.split("\n")
+                    if 'addAddressAndPort("' in l and not l.strip().startswith("//")]
+          if active:
+              fail("unconverted addAddressAndPort() call(s) left in initDatacenters(): %s" % " | ".join(active))
+          if "addAddressAndPort(ipv4" not in new_func:
+              fail("custom server address was not injected into initDatacenters()")
+
+          with open(CM_PATH, "w", encoding="utf-8", newline="\n") as f:
+              f.write(src)
+          print("ConnectionsManager.cpp: initDatacenters() -> %s:%s, IPv6 disabled"
+                % (SERVER_IPV4, SERVER_PORT))
+          print("Native patches applied OK")
+          PYEOF
+
+          echo ""
+          echo "=================== PATCH SUMMARY ==================="
+          echo "--- Handshake.cpp fingerprints ---"
+          grep -n "serverPublicKeysFingerprints.push_back" TMessagesProj/jni/tgnet/Handshake.cpp || true
+          echo "--- ConnectionsManager.cpp initDatacenters() ---"
+          sed -n '/void ConnectionsManager::initDatacenters/,/^}/p' TMessagesProj/jni/tgnet/ConnectionsManager.cpp
+          echo "--- google-services plugin lines ---"
+          grep -rn "gms.google-services" --include="build.gradle" . || echo "(none)"
+          echo "--- google-services.json package names ---"
+          grep -rh "\"package_name\"" --include="google-services.json" . | sort -u || true
+          echo "====================================================="
+          git --no-pager diff --stat || true
+
+      - name: Make Gradle Executable
+        run: chmod +x gradlew
+
+      - name: Build Release APK
+        run: ./gradlew --no-daemon --max-workers=2 :TMessagesProj_App:assembleRelease -x test
+
+      - name: Find outputs
+        if: always()
+        run: |
+          find . \( -name "*.apk" -o -name "*.aab" \) -not -path "*/.cxx/*" || echo "none found"
+          df -h
+
+      - name: Upload APK Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Drop-Release-APK
+          path: TMessagesProj_App/build/outputs/apk/**/*.apk
+          if-no-files-found: warn
